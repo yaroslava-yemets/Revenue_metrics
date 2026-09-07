@@ -1,0 +1,113 @@
+-- Create base CTE table groupes by month for future calculations
+with monthly_revenue as(
+	select
+		user_id,
+		date(date_trunc('month', payment_date)) as payment_month,
+		sum(revenue_amount_usd) as month_revenue
+	from project.games_payments gp
+	group by payment_month, gp.user_id
+), 
+-- create base table with the next/previous months
+user_months as (
+	select
+		user_id,
+		month_revenue,
+		payment_month,
+		-- previous/next month in calendar sense
+        date(payment_month - interval '1 month') as previous_calendar_month,
+        date(payment_month + interval '1 month') as next_calendar_month,
+		-- previous month of payment
+        LAG(payment_month) OVER(PARTITION BY user_id
+            ORDER BY payment_month) AS previous_paid_month,
+        -- previous revenue
+        LAG(month_revenue) OVER(PARTITION BY user_id
+            ORDER BY payment_month) as previous_paid_month_revenue,
+		-- next month of payment
+		LEAD(payment_month) OVER (PARTITION BY user_id
+            ORDER BY payment_month) as next_paid_month
+	from monthly_revenue
+),
+-- Create additional columns for new mrr, new paid users, churn revenue, 
+-- churn users, churn month, expansion revenue, contracion revenue
+additional_columns_basic as(
+	select *,
+    	case
+        	when previous_paid_month IS NULL 
+        	then month_revenue
+    	end as new_mrr_base,
+    	case
+        	when previous_paid_month IS NULL 
+        	then 1
+    	end as new_paid_users_base,
+    	case
+        	when next_paid_month IS NULL 
+        		or next_paid_month != next_calendar_month
+        	then month_revenue
+    	end as churn_revenue_base,
+    	case
+        	when next_paid_month IS NULL 
+        		or next_paid_month != next_calendar_month
+        	then 1
+    	end as churn_users_base,
+    	case
+        	when next_paid_month IS NULL 
+        		or next_paid_month != next_calendar_month
+        	then next_calendar_month
+    	end as churn_month,
+    	case 
+		 	when previous_paid_month = previous_calendar_month
+	        	and month_revenue > previous_paid_month_revenue
+	     	then month_revenue - previous_paid_month_revenue
+	    end as expansion_revenue, 
+	    case 
+		 	when previous_paid_month = previous_calendar_month
+	        	and month_revenue < previous_paid_month_revenue
+	     	then month_revenue - previous_paid_month_revenue
+	    end as contraction_revenue,
+	    case
+	    	when previous_paid_month IS NOT NULL
+	    		and DATEDIFF ('month', previous_paid_month, payment_month) >=2
+	    	then 1
+	    end as churn_return
+	from user_months
+),
+-- Calculate all main metricts: MRR, Paid Users, ARPPU, New Paid Users, 
+--New MRR, Churned Users, Churned revenue, Expansion MRR, Contraction MRR
+calculations as (
+	select
+		payment_month,
+		user_id,
+		churn_month,
+		sum(month_revenue) as mrr,
+		count (distinct user_id) as paid_users_amount,
+		sum(month_revenue) / nullif(count(distinct user_id), 0) as arppu,
+		sum(new_paid_users_base) as new_paid_users,
+		sum(new_mrr_base) as new_mrr,
+		sum(churn_users_base) as churn_users,
+		sum(churn_revenue_base) as churn_revenue,
+		sum(expansion_revenue) as total_expansion_mrr,
+    	sum(contraction_revenue) as total_contraction_mrr,
+    	sum(churn_return) as users_return_from_churn
+	from additional_columns_basic
+	group by payment_month, user_id, churn_month
+),
+-- Add calculations of Churn Rate and Revenue Churn rate
+churn_calc as (
+	select *, 
+		churn_users::numeric/LAG(paid_users_amount)OVER(ORDER BY payment_month) as churn_rate,
+		churn_revenue/LAG(mrr)OVER(ORDER BY payment_month) as revenue_churn_rate
+	from calculations
+),
+-- Add calculations of Customer LifeTime (LT) and Customer LifeTime Value (LTV)
+lt_calc as (
+	select *,
+		1/churn_rate as livetime,
+		arppu * (1/churn_rate) as livetime_value
+	from churn_calc
+)
+-- Join table with lg, device, age, game name
+select *
+from lt_calc
+left join project.games_paid_users gpu
+	on lt_calc.user_id = gpu.user_id
+;
